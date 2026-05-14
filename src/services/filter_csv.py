@@ -1,80 +1,112 @@
 import os
-import pandas as pd
 import time
-from detoxify import Detoxify
+import pandas as pd
+from openai import OpenAI
+from dotenv import load_dotenv
 
-_model = None
+load_dotenv()
 
-def _get_model() -> Detoxify:
-    """Carrega modelo Detoxify em cache global."""
-    global _model
-    if _model is None:
-        print("📦 Carregando modelo Detoxify...")
-        _model = Detoxify("multilingual")
-    return _model
-    
+_BATCH_SIZE = 16   # textos por chamada à Moderation API
+_BATCH_DELAY = 22.0  # pausa entre batches — respeita limite de ~3 RPM em contas free
+
+_client = None
+
+
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    return _client
+
+
+def _is_rate_limit(e: Exception) -> bool:
+    msg = str(e).lower()
+    return "429" in msg or "rate limit" in msg or "too many" in msg
+
+
+def _score_batch(texts: list[str]) -> list[float]:
+    """Envia um lote de textos em uma única chamada com retry em caso de 429."""
+    max_retries = 2
+    wait = 5.0
+    for attempt in range(max_retries):
+        try:
+            result = _get_client().moderations.create(input=texts)
+            scores = []
+            for item in result.results:
+                s = item.category_scores
+                scores.append(float(max(
+                    s.harassment,
+                    s.harassment_threatening,
+                    s.hate,
+                    s.hate_threatening,
+                    s.sexual,
+                    s.sexual_minors,
+                    s.violence,
+                )))
+            flagged = sum(1 for sc in scores if sc >= 0.7)
+            print(f"🔍 OpenAI Moderation: {len(texts)} textos analisados | scores: {[round(sc, 3) for sc in scores]} | flagged: {flagged}")
+            return scores
+        except Exception as e:
+            if _is_rate_limit(e) and attempt < max_retries - 1:
+                sleep_time = wait * (2 ** attempt)  # 2s → 4s → 8s → 16s
+                print(f"⚠️  Rate limit (tentativa {attempt + 1}/{max_retries}), aguardando {sleep_time:.0f}s...")
+                time.sleep(sleep_time)
+            else:
+                if _is_rate_limit(e):
+                    print("⚠️  Rate limit persistente após todas as tentativas, retornando 0.0.")
+                else:
+                    print(f"⚠️  Erro no lote: {e}")
+                return [0.0] * len(texts)
+    return [0.0] * len(texts)
+
 
 def get_toxicity_score(text: str) -> float:
-    """Calcula score de toxicidade (0.0-1.0) para um texto."""
+    """Calcula score de toxicidade (0.0-1.0) para um único texto."""
     if not text or not text.strip():
         return 0.0
-    
-    try:
-        model = _get_model()
-        results = model.predict(text)
-        
-        score = max(
-            results.get("toxicity", 0.0),
-            results.get("severe_toxicity", 0.0),
-            results.get("threat", 0.0),
-            results.get("insult", 0.0)
-        )
-        return float(score)
-    except Exception as e:
-        print(f"⚠️  Erro ao processar: {e}")
-        return 0.0
+    return _score_batch([text])[0]
 
 
 def apply_filter(
     df: pd.DataFrame,
     threshold: float = 0.7,
-    delay: float = 0.05,
+    delay: float = 0.0,
     verbose: bool = False
 ) -> pd.DataFrame:
+    """Adiciona colunas 'toxicity' e 'flagged' para todos os comentários.
+
+    Envia em batches de _BATCH_SIZE para a Moderation API com retry em 429.
+    Retorna o DataFrame completo com scores — a filtragem é responsabilidade do chamador.
+    """
     if df.empty:
         return df
-    
+
     df = df.copy()
-    total = len(df)
-    
+    texts = df["comment"].fillna("").astype(str).tolist()
+    total = len(texts)
+
     if verbose:
-        print(f"⏳ Analisando toxicidade ({total} comentários)...")
-    
+        print(f"⏳ Analisando toxicidade ({total} comentários, batches de {_BATCH_SIZE})...")
+
     scores = []
-    for i, text in enumerate(df["comment"].fillna("").astype(str)):
-        score = get_toxicity_score(text)
-        scores.append(score)
-        
-        if verbose and (i + 1) % 10 == 0:
-            print(f"   ✓ {i + 1}/{total}")
-        
-        time.sleep(delay)
-    
-    # Adiciona colunas de score e flag
+    for i in range(0, total, _BATCH_SIZE):
+        batch = texts[i : i + _BATCH_SIZE]
+        scores.extend(_score_batch(batch))
+        if verbose:
+            print(f"   ✓ {min(i + _BATCH_SIZE, total)}/{total}")
+        if i + _BATCH_SIZE < total:
+            time.sleep(_BATCH_DELAY)
+
     df["toxicity"] = scores
     df["flagged"] = df["toxicity"] >= threshold
-    
-    # Retorna apenas o que foi flagged (ofensivos)
-    return df[df["flagged"]].reset_index(drop=True)
+    return df
 
 
 def _generate_output_path(input_path: str, suffix: str = "_flagged") -> str:
-    """Gera caminho de saída com sufixo."""
     directory = os.path.dirname(input_path)
     filename = os.path.basename(input_path)
     name_without_ext = filename.replace(".csv", "")
-    output_filename = f"{name_without_ext}{suffix}.csv"
-    return os.path.join(directory, output_filename)
+    return os.path.join(directory, f"{name_without_ext}{suffix}.csv")
 
 
 def filter_csv_file(
@@ -82,26 +114,22 @@ def filter_csv_file(
     threshold: float = 0.7,
     delay: float = 0.1
 ) -> dict:
-    # Valida entrada
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Arquivo não encontrado: {input_path}")
-    
-    # Lê CSV
+
     df = pd.read_csv(input_path)
     total = len(df)
     print(f"\n📄 Processando: {input_path}")
     print(f"   Total de comentários: {total}")
-    
-    # Aplica filtro
-    filtered_df = apply_filter(df, threshold=threshold, delay=delay, verbose=True)
-    
-    # Exibe resultados
+
+    df_scored = apply_filter(df, threshold=threshold, delay=delay, verbose=True)
+    filtered_df = df_scored[df_scored["flagged"]].reset_index(drop=True)
+
     safe = total - len(filtered_df)
     print(f"\n✅ Análise concluída:")
     print(f"   ✓ Seguros: {safe}")
     print(f"   ✗ Ofensivos (threshold={threshold}): {len(filtered_df)}")
-    
-    # Salva apenas ofensivos
+
     flagged_path = None
     if len(filtered_df) > 0:
         flagged_path = _generate_output_path(input_path)
@@ -109,18 +137,18 @@ def filter_csv_file(
         print(f"   🚨 Arquivo salvo: {flagged_path}")
     else:
         print(f"   ℹ️  Nenhum comentário ofensivo encontrado")
-    
+
     return {
         "total": total,
         "safe": safe,
         "flagged": len(filtered_df),
         "threshold": threshold,
-        "flagged_path": flagged_path
+        "flagged_path": flagged_path,
     }
+
 
 if __name__ == "__main__":
     import sys
     input_csv = sys.argv[1]
     threshold = float(sys.argv[2]) if len(sys.argv) > 2 else 0.7
-    
     filter_csv_file(input_csv, threshold=threshold)

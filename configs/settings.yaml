@@ -19,11 +19,6 @@ services:
   perspective_weight: 0.4
 
 storage:
-  mongo_url: mongodb://localhost:27017
-  db: bigdata_mvp
-  collection: comments_analysis
-
-storage:
-  provider: firestore
-  ttl_days: 1
+  provider: supabase
+  ttl_days: 30
 

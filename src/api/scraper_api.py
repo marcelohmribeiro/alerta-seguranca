@@ -67,7 +67,7 @@ def instagram_web_one(user: str, password: str, mode: str, id: str, limit: int =
     if save:
         csv_path = save_csv(df, platform="instagram", identifier=id, kind=mode)
     response = df_to_json(df)
-    return {"data": response, "csv_path": csv_path}
+    return {"data": response, "csv_path": csv_path if save else None}
 
 @app.post("/instagram/web/much")
 def instagram_web_much(user: str, password: str, body: dict = Body(...), limit: int = 10, save: bool = False):

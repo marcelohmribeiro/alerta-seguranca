@@ -15,3 +15,5 @@ snscrape
 youtube-comment-downloader
 selenium
 webdriver-manager
+openai
+supabase

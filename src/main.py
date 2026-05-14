@@ -21,10 +21,9 @@ from rules.filter import compile_regex_patterns, apply_rules
 from semantic.encoder import SemanticEncoder
 from classify.aggregator import aggregate_risk
 from services.filter_csv import get_toxicity_score
-from storage.firestore import (
-    get_client as fs_client,
-    save_records as fs_save,
-    delete_older_than as fs_ttl,
+from storage.supabase_client import (
+    save_records as sb_save,
+    delete_older_than as sb_ttl,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -189,17 +188,16 @@ def run_pipeline(args) -> List[CommentRecord]:
         )
         results.append(rec)
     if args.persist:
-        logger.info("Persistindo no Firestore (Firebase)...")
-        client = fs_client()
+        logger.info("Persistindo no Supabase...")
         try:
             ttl_days = int(storage.get("ttl_days", 30))
-            deleted = fs_ttl(client, "comments", days=ttl_days)
-            logger.info("[Firestore] TTL por código: removidos %d docs antigos (ttl_days=%d).", deleted, ttl_days)
+            deleted = sb_ttl(days=ttl_days)
+            logger.info("[Supabase] TTL: removidos %d docs antigos (ttl_days=%d).", deleted, ttl_days)
         except Exception as e:
-            logger.warning("[Firestore] TTL falhou (ignorado no MVP): %s", e)
+            logger.warning("[Supabase] TTL falhou (ignorado): %s", e)
 
-        created, _ = fs_save(client, "comments", results)
-        logger.info("[Firestore] Gravados %d documentos (upsert).", created)
+        created, _ = sb_save(results)
+        logger.info("[Supabase] Gravados %d documentos (upsert).", created)
 
     sus = sum(1 for r in results if r.classification == "suspeito")
     aten = sum(1 for r in results if r.classification == "atencao")
